@@ -1,6 +1,8 @@
-//! Server entry point. Ported from `apps/redis_server.cpp`: CLI options,
-//! graceful shutdown via a self-pipe, and SIGPIPE-safe writes.
+//! Server entry point. Ported from `apps/redis_server.cpp`: CLI options and
+//! graceful shutdown via a self-pipe. (SIGPIPE needs no handling: the Rust
+//! runtime ignores it, so a write to a closed socket returns `EPIPE`.)
 
+use std::net::SocketAddr;
 use std::os::raw::{c_int, c_void};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -10,10 +12,15 @@ use redis_rust::server::{Server, ServerOptions};
 const SIGINT: c_int = 2;
 const SIGTERM: c_int = 15;
 
-type SignalHandler = extern "C" fn(c_int);
+/// C `sighandler_t`. It is declared as a plain integer, not as
+/// `extern "C" fn`, because `signal()` returns `SIG_DFL` (0, a null function
+/// pointer) or `SIG_ERR` (-1); materializing either as a Rust `fn` pointer,
+/// which must be non-null and valid, is undefined behaviour.
+type SigHandlerT = usize;
+const SIG_ERR: SigHandlerT = usize::MAX;
 
 unsafe extern "C" {
-    fn signal(sig: c_int, handler: SignalHandler) -> SignalHandler;
+    fn signal(sig: c_int, handler: SigHandlerT) -> SigHandlerT;
     fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
 }
 
@@ -32,12 +39,18 @@ extern "C" fn on_signal(_sig: c_int) {
     }
 }
 
-fn install_signal_handlers() {
-    // SAFETY: the handler only performs an async-signal-safe write().
-    unsafe {
-        signal(SIGINT, on_signal);
-        signal(SIGTERM, on_signal);
+fn install_signal_handlers() -> Result<(), String> {
+    let handler = on_signal as extern "C" fn(c_int) as SigHandlerT;
+    for sig in [SIGINT, SIGTERM] {
+        // SAFETY: `handler` is a valid `extern "C" fn(c_int)` that only
+        // performs an async-signal-safe write(); the return value is only
+        // compared, never called.
+        let prev = unsafe { signal(sig, handler) };
+        if prev == SIG_ERR {
+            return Err(format!("signal({sig}) failed"));
+        }
     }
+    Ok(())
 }
 
 fn parse_options(args: &[String]) -> Option<ServerOptions> {
@@ -52,7 +65,14 @@ fn parse_options(args: &[String]) -> Option<ServerOptions> {
         }
         let value = args.get(i + 1)?;
         match arg {
+            "--bind" => opts.bind_addr = value.parse().ok()?,
             "--port" => opts.port = value.parse().ok()?,
+            "--max-clients" => {
+                opts.max_clients = value.parse().ok()?;
+                if opts.max_clients == 0 {
+                    return None;
+                }
+            }
             "--idle-timeout-ms" => opts.idle_timeout_ms = value.parse().ok()?,
             "--threads" => {
                 opts.worker_threads = value.parse().ok()?;
@@ -71,15 +91,17 @@ fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(opts) = parse_options(&args) else {
         return Err(
-            "usage: redis_server [--port N] [--idle-timeout-ms N] [--threads N] [--quiet]"
+            "usage: redis_server [--bind ADDR] [--port N] [--idle-timeout-ms N] [--threads N] \
+             [--max-clients N] [--quiet]"
                 .to_string(),
         );
     };
 
+    let bind_addr = opts.bind_addr;
     let mut server = Server::new(opts).map_err(|e| e.to_string())?;
     WAKE_FD.store(server.wake_fd(), Ordering::Relaxed);
-    install_signal_handlers();
-    eprintln!("listening on 0.0.0.0:{}", server.port());
+    install_signal_handlers()?;
+    eprintln!("listening on {}", SocketAddr::new(bind_addr, server.port()));
     let result = server.run().map_err(|e| e.to_string());
     WAKE_FD.store(-1, Ordering::Relaxed);
     eprintln!("shutting down");

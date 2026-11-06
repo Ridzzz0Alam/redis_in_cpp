@@ -19,12 +19,16 @@ struct TestServer {
 
 impl TestServer {
     fn start() -> Self {
-        let opts = ServerOptions {
+        Self::start_with(ServerOptions {
             port: 0,
             verbose: false,
             idle_timeout_ms: 500,
             worker_threads: 4,
-        };
+            ..ServerOptions::default()
+        })
+    }
+
+    fn start_with(opts: ServerOptions) -> Self {
         let mut server = Server::new(opts).expect("start server");
         let port = server.port();
         let stop = server.stop_handle().expect("stop handle");
@@ -129,9 +133,89 @@ fn malformed_request_closes_connection() {
 fn idle_connections_are_closed() {
     let server = TestServer::start();
     let mut stream = server.connect();
-    thread::sleep(Duration::from_millis(1200));
+    // Block until the server closes us (no fixed sleep to race against); the
+    // timeout only bounds a broken server.
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
     let mut byte = [0u8; 1];
     assert_eq!(stream.read(&mut byte).unwrap(), 0); // EOF: server closed us
+}
+
+// A client that pipelines many large replies must be throttled, not buffered
+// in full, and every held-back request must still be answered once it reads.
+#[test]
+fn pending_output_is_bounded_and_resumes() {
+    let server = TestServer::start_with(ServerOptions {
+        port: 0,
+        verbose: false,
+        max_pending_output: 1 << 20,
+        ..ServerOptions::default()
+    });
+    let mut stream = server.connect();
+    let value = "v".repeat(256 << 10);
+    assert!(call(&mut stream, &cmd(&["set", "k", &value])).is_ok());
+
+    const N: usize = 64; // 16 MiB of replies for ~1 KiB of requests
+    let mut batch: Buffer = Buffer::new();
+    for _ in 0..N {
+        batch.extend_from_slice(&encode_request(&cmd(&["get", "k"])));
+    }
+    assert!(write_all(&mut stream, &batch));
+    thread::sleep(Duration::from_millis(200)); // let the server hit the limit
+    for i in 0..N {
+        match read_response(&mut stream).expect("response") {
+            Value::Str(v) => assert_eq!(v.len(), value.len(), "response {i}"),
+            other => panic!("response {i}: {other:?}"),
+        }
+    }
+    // The connection is still usable afterwards.
+    assert_eq!(
+        call(&mut stream, &cmd(&["del", "k"])).unwrap(),
+        Value::Int(1)
+    );
+}
+
+// Replies queued before a protocol error are delivered before the close.
+#[test]
+fn replies_before_a_bad_request_are_flushed() {
+    let server = TestServer::start();
+    let mut stream = server.connect();
+    let mut batch = encode_request(&cmd(&["set", "a", "1"]));
+    batch.extend_from_slice(&encode_request(&cmd(&["get", "a"])));
+    batch.extend_from_slice(&[5, 0, 0, 0, 1, 2, 3, 4, 5]); // malformed
+    assert!(write_all(&mut stream, &batch));
+    assert_eq!(read_response(&mut stream).unwrap(), Value::Nil);
+    assert_eq!(
+        read_response(&mut stream).unwrap(),
+        Value::Str(b"1".to_vec())
+    );
+    assert!(read_response(&mut stream).is_err()); // then EOF
+}
+
+#[test]
+fn max_clients_is_enforced() {
+    let server = TestServer::start_with(ServerOptions {
+        port: 0,
+        verbose: false,
+        max_clients: 2,
+        ..ServerOptions::default()
+    });
+    let mut a = server.connect();
+    let mut b = server.connect();
+    assert!(call(&mut a, &cmd(&["get", "x"])).is_ok());
+    assert!(call(&mut b, &cmd(&["get", "x"])).is_ok());
+    let mut c = server.connect(); // TCP handshake succeeds via the backlog...
+    assert!(call(&mut c, &cmd(&["get", "x"])).is_err()); // ...then it is closed
+    drop(a);
+    thread::sleep(Duration::from_millis(100));
+    let mut d = server.connect(); // a slot is free again
+    assert!(call(&mut d, &cmd(&["get", "x"])).is_ok());
+}
+
+#[test]
+fn default_bind_is_loopback() {
+    assert!(ServerOptions::default().bind_addr.is_loopback());
 }
 
 #[test]

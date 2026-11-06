@@ -7,6 +7,8 @@
 //! A `ZNode` can therefore still live in a hashtable and an AVL tree at the
 //! same time without copying.
 
+use std::num::NonZeroUsize;
+
 use crate::avl::{AvlArena, AvlNode};
 use crate::common::str_hash;
 
@@ -19,9 +21,22 @@ pub trait HashNode {
     fn set_hnext(&mut self, next: Option<usize>);
 }
 
+/// A slot link: arena index + 1, so that `None` is all-zero bytes. That lets
+/// `vec![None; n]` use a zeroed (lazily-paged) allocation instead of writing
+/// every slot, which keeps `trigger_rehashing` cheap for huge tables.
+type Link = Option<NonZeroUsize>;
+
+fn to_link(idx: usize) -> Link {
+    NonZeroUsize::new(idx + 1)
+}
+
+fn from_link(link: Link) -> Option<usize> {
+    link.map(|l| l.get() - 1)
+}
+
 #[derive(Clone, Default)]
 struct Table {
-    slots: Vec<Option<usize>>,
+    slots: Vec<Link>,
     mask: usize,
     size: usize,
 }
@@ -40,9 +55,77 @@ impl Table {
 const REHASHING_WORK: usize = 128;
 const MAX_LOAD_FACTOR: usize = 8;
 
+/// Node storage split into fixed-size chunks.
+///
+/// A single `Vec<Option<V>>` reallocates and copies *every* node when it
+/// grows, which is the same O(n) pause progressive rehashing exists to avoid.
+/// Chunks never move once allocated; only the small vector of chunk handles
+/// grows. The first chunk grows normally (bounded by `CHUNK`) so tiny maps,
+/// such as small sorted sets, don't pay for a full chunk up front.
+struct Arena<V> {
+    chunks: Vec<Vec<Option<V>>>,
+    len: usize,
+}
+
+const CHUNK_BITS: usize = 10;
+const CHUNK: usize = 1 << CHUNK_BITS;
+
+impl<V> Arena<V> {
+    fn new() -> Self {
+        Self {
+            chunks: Vec::new(),
+            len: 0,
+        }
+    }
+
+    fn slot(&self, idx: usize) -> Option<&Option<V>> {
+        if idx >= self.len {
+            return None;
+        }
+        Some(&self.chunks[idx >> CHUNK_BITS][idx & (CHUNK - 1)])
+    }
+
+    fn slot_mut(&mut self, idx: usize) -> &mut Option<V> {
+        assert!(idx < self.len, "arena index out of range");
+        &mut self.chunks[idx >> CHUNK_BITS][idx & (CHUNK - 1)]
+    }
+
+    fn node(&self, idx: usize) -> &V {
+        self.slot(idx)
+            .and_then(Option::as_ref)
+            .expect("live hashtable node")
+    }
+
+    fn node_mut(&mut self, idx: usize) -> &mut V {
+        self.slot_mut(idx).as_mut().expect("live hashtable node")
+    }
+
+    fn push(&mut self, value: V) -> usize {
+        match self.chunks.last_mut() {
+            Some(chunk) if chunk.len() < CHUNK => chunk.push(Some(value)),
+            _ => {
+                let mut chunk = if self.chunks.is_empty() {
+                    Vec::new()
+                } else {
+                    Vec::with_capacity(CHUNK)
+                };
+                chunk.push(Some(value));
+                self.chunks.push(chunk);
+            }
+        }
+        self.len += 1;
+        self.len - 1
+    }
+
+    fn clear(&mut self) {
+        self.chunks = Vec::new();
+        self.len = 0;
+    }
+}
+
 /// Hashtable with two tables for progressive rehashing.
 pub struct HMap<V> {
-    nodes: Vec<Option<V>>,
+    nodes: Arena<V>,
     free: Vec<usize>,
     newer: Table,
     older: Option<Table>,
@@ -59,7 +142,7 @@ impl<V> Default for HMap<V> {
 impl<V> HMap<V> {
     pub fn new() -> Self {
         Self {
-            nodes: Vec::new(),
+            nodes: Arena::new(),
             free: Vec::new(),
             newer: Table::default(),
             older: None,
@@ -78,16 +161,16 @@ impl<V> HMap<V> {
 
     /// Immutable access to an arena slot. Panics if `idx` is not live.
     pub fn get(&self, idx: usize) -> &V {
-        self.nodes[idx].as_ref().expect("live hashtable node")
+        self.nodes.node(idx)
     }
 
     /// Mutable access to an arena slot.
     pub fn get_mut(&mut self, idx: usize) -> &mut V {
-        self.nodes[idx].as_mut().expect("live hashtable node")
+        self.nodes.node_mut(idx)
     }
 
     pub fn contains_index(&self, idx: usize) -> bool {
-        self.nodes.get(idx).is_some_and(Option::is_some)
+        self.nodes.slot(idx).is_some_and(Option::is_some)
     }
 
     /// Iterate over every live node.
@@ -99,13 +182,10 @@ impl<V> HMap<V> {
             .into_iter()
             .flatten()
         {
-            if table.slots.is_empty() {
-                continue;
-            }
             for slot in &table.slots {
-                let mut cur = *slot;
+                let mut cur = from_link(*slot);
                 while let Some(idx) = cur {
-                    let node = self.nodes[idx].as_ref().expect("live hashtable node");
+                    let node = self.nodes.node(idx);
                     if !f(idx, node) {
                         return;
                     }
@@ -115,9 +195,10 @@ impl<V> HMap<V> {
         }
     }
 
+    /// Drop every node and release all memory.
     pub fn clear(&mut self) {
         self.nodes.clear();
-        self.free.clear();
+        self.free = Vec::new();
         self.newer = Table::default();
         self.older = None;
         self.len = 0;
@@ -125,28 +206,23 @@ impl<V> HMap<V> {
     }
 }
 
-fn h_insert<V: HashNode>(nodes: &mut [Option<V>], table: &mut Table, idx: usize) {
-    let hcode = nodes[idx].as_ref().expect("live node").hcode();
+fn h_insert<V: HashNode>(nodes: &mut Arena<V>, table: &mut Table, idx: usize) {
+    let hcode = nodes.node(idx).hcode();
     let pos = hcode as usize & table.mask;
-    let head = table.slots[pos];
-    nodes[idx].as_mut().expect("live node").set_hnext(head);
-    table.slots[pos] = Some(idx);
+    let head = from_link(table.slots[pos]);
+    nodes.node_mut(idx).set_hnext(head);
+    table.slots[pos] = to_link(idx);
     table.size += 1;
 }
 
-fn h_lookup<V: HashNode>(
-    nodes: &[Option<V>],
-    table: &Table,
-    key: &[u8],
-    hcode: u64,
-) -> Option<usize> {
+fn h_lookup<V: HashNode>(nodes: &Arena<V>, table: &Table, key: &[u8], hcode: u64) -> Option<usize> {
     if table.slots.is_empty() {
         return None;
     }
     let pos = hcode as usize & table.mask;
-    let mut cur = table.slots[pos];
+    let mut cur = from_link(table.slots[pos]);
     while let Some(idx) = cur {
-        let node = nodes[idx].as_ref().expect("live node");
+        let node = nodes.node(idx);
         if node.hcode() == hcode && node.key() == key {
             return Some(idx);
         }
@@ -155,23 +231,22 @@ fn h_lookup<V: HashNode>(
     None
 }
 
-fn unlink<V: HashNode>(nodes: &mut [Option<V>], table: &mut Table, idx: usize, hcode: u64) -> bool {
+fn unlink<V: HashNode>(nodes: &mut Arena<V>, table: &mut Table, idx: usize, hcode: u64) -> bool {
     if table.slots.is_empty() {
         return false;
     }
     let pos = hcode as usize & table.mask;
-    if table.slots[pos] == Some(idx) {
-        let next = nodes[idx].as_ref().expect("live node").hnext();
-        table.slots[pos] = next;
+    if from_link(table.slots[pos]) == Some(idx) {
+        table.slots[pos] = to_link_opt(nodes.node(idx).hnext());
         table.size -= 1;
         return true;
     }
-    let mut cur = table.slots[pos];
+    let mut cur = from_link(table.slots[pos]);
     while let Some(c) = cur {
-        let next = nodes[c].as_ref().expect("live node").hnext();
+        let next = nodes.node(c).hnext();
         if next == Some(idx) {
-            let nn = nodes[idx].as_ref().expect("live node").hnext();
-            nodes[c].as_mut().expect("live node").set_hnext(nn);
+            let nn = nodes.node(idx).hnext();
+            nodes.node_mut(c).set_hnext(nn);
             table.size -= 1;
             return true;
         }
@@ -180,14 +255,17 @@ fn unlink<V: HashNode>(nodes: &mut [Option<V>], table: &mut Table, idx: usize, h
     false
 }
 
+fn to_link_opt(idx: Option<usize>) -> Link {
+    idx.and_then(to_link)
+}
+
 impl<V: HashNode> HMap<V> {
     fn alloc_node(&mut self, node: V) -> usize {
         if let Some(idx) = self.free.pop() {
-            self.nodes[idx] = Some(node);
+            *self.nodes.slot_mut(idx) = Some(node);
             idx
         } else {
-            self.nodes.push(Some(node));
-            self.nodes.len() - 1
+            self.nodes.push(node)
         }
     }
 
@@ -214,19 +292,17 @@ impl<V: HashNode> HMap<V> {
                 self.migrate_pos = pos;
                 break;
             }
-            let idx = older.slots[pos].expect("non-empty slot");
-            let next = self.nodes[idx].as_ref().expect("live node").hnext();
-            older.slots[pos] = next;
+            let idx = from_link(older.slots[pos]).expect("non-empty slot");
+            older.slots[pos] = to_link_opt(self.nodes.node(idx).hnext());
             older.size -= 1;
             self.migrate_pos = pos;
             h_insert(&mut self.nodes, &mut self.newer, idx);
             nwork += 1;
         }
-        if older.size == 0 {
-            // Dropping `older` frees its slot array, like the C++ free().
-        } else {
+        if older.size > 0 {
             self.older = Some(older);
         }
+        // else: dropping `older` frees its slot array, like the C++ free().
     }
 
     /// Insert a node (its key is hashed here) and return its stable arena index.
@@ -253,12 +329,7 @@ impl<V: HashNode> HMap<V> {
     /// Look a node up by key. Returns its arena index.
     pub fn lookup(&mut self, key: &[u8], hcode: u64) -> Option<usize> {
         self.help_rehashing();
-        if let Some(idx) = h_lookup(&self.nodes, &self.newer, key, hcode) {
-            return Some(idx);
-        }
-        self.older
-            .as_ref()
-            .and_then(|t| h_lookup(&self.nodes, t, key, hcode))
+        self.lookup_no_rehash(key, hcode)
     }
 
     /// Look a node up by key without triggering rehashing.
@@ -279,7 +350,7 @@ impl<V: HashNode> HMap<V> {
 
     /// Unlink and remove a node by its arena index, returning the payload.
     pub fn remove_index(&mut self, idx: usize) -> Option<V> {
-        let hcode = self.nodes.get(idx)?.as_ref()?.hcode();
+        let hcode = self.nodes.slot(idx)?.as_ref()?.hcode();
         let removed = unlink(&mut self.nodes, &mut self.newer, idx, hcode)
             || match self.older.as_mut() {
                 Some(table) => unlink(&mut self.nodes, table, idx, hcode),
@@ -288,9 +359,15 @@ impl<V: HashNode> HMap<V> {
         if !removed {
             return None;
         }
-        let value = self.nodes[idx].take();
-        self.free.push(idx);
+        let value = self.nodes.slot_mut(idx).take();
         self.len -= 1;
+        if self.len == 0 {
+            // Nothing references the arena any more: give the memory back
+            // instead of keeping the high-water mark forever.
+            self.clear();
+        } else {
+            self.free.push(idx);
+        }
         value
     }
 }

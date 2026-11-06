@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # Adapted from "Build Your Own Redis with C/C++" (build-your-own.org), 11/test_cmds.py.
-# Changes: starts its own server on a free port and takes the binary paths as arguments.
+# Changes: starts its own server on an OS-chosen port, takes the binary paths as
+# arguments, and checks the CLI exit status (1 = error reply).
 import argparse
+import re
 import shlex
-import socket
 import subprocess
 import sys
-import time
 
 CASES = r'''
 $ zscore asdf n1
@@ -50,15 +50,39 @@ $ set k v
 (nil)
 $ get k
 (str) v
+$ SET k v2
+(nil)
+$ pexpire k 100000
+(int) 1
+$ set k v3
+(nil)
+$ pttl k
+(int) -1
+$ zquery zset 100 "" -1 1
+(arr) len=2
+(str) n2
+(dbl) 2
+(arr) end
 $ unknowncmd
 (err) 1 unknown command.
 '''
 
 
-def free_port():
-    with socket.socket() as s:
-        s.bind(('127.0.0.1', 0))
-        return s.getsockname()[1]
+def start_server(path):
+    """Start the server on an OS-chosen port and return (process, port).
+
+    Binding port 0 inside the server avoids the race of picking a "free" port
+    here and hoping nobody takes it before the server binds it.
+    """
+    server = subprocess.Popen([path, '--port', '0', '--quiet'],
+                              stderr=subprocess.PIPE, text=True)
+    line = server.stderr.readline()  # "listening on 127.0.0.1:PORT"
+    match = re.search(r':(\d+)$', line.strip())
+    if not match:
+        server.kill()
+        rest = server.stderr.read()
+        sys.exit(f'server failed to start: {line}{rest}')
+    return server, int(match.group(1))
 
 
 def main():
@@ -78,20 +102,17 @@ def main():
         else:
             outputs[-1] += line + '\n'
 
-    port = free_port()
-    server = subprocess.Popen([args.server, '--port', str(port), '--quiet'])
+    server, port = start_server(args.server)
     try:
-        for _ in range(100):  # wait until it accepts connections
-            try:
-                socket.create_connection(('127.0.0.1', port), timeout=0.1).close()
-                break
-            except OSError:
-                time.sleep(0.05)
         for cmd, expect in zip(cmds, outputs):
-            out = subprocess.check_output(
-                [args.cli, '--port', str(port)] + shlex.split(cmd)).decode()
-            if out != expect:
-                print(f'FAIL: {cmd}\n--- got ---\n{out}--- expected ---\n{expect}')
+            # Exit status 1 means "the server replied with an error", which
+            # some cases expect; anything else non-zero is a real failure.
+            res = subprocess.run([args.cli, '--port', str(port)] + shlex.split(cmd),
+                                 capture_output=True, text=True, timeout=10)
+            want_rc = 1 if expect.startswith('(err)') else 0
+            if res.stdout != expect or res.returncode != want_rc:
+                print(f'FAIL: {cmd} (exit {res.returncode}, expected {want_rc})\n'
+                      f'--- got ---\n{res.stdout}{res.stderr}--- expected ---\n{expect}')
                 return 1
         print(f'all {len(cmds)} commands passed')
         return 0

@@ -67,7 +67,9 @@ Clients ──TCP──► poll() event loop ──► Database
    - parse the request into `Vec<Vec<u8>>` (binary-safe),
    - call `Database::execute`,
    - serialize one response into `Conn::outgoing`,
-   - consume **only** the handled request's bytes.
+   - consume **only** the handled request's bytes,
+   - stop early once **4 MiB** of replies are pending (backpressure); the rest
+     run after the client has read its replies.
 4. `handle_write` writes as much of `outgoing` as the socket accepts.
 5. If part of the response remains, `poll` waits for `POLLOUT` and writes again.
 
@@ -86,6 +88,8 @@ requests sent in one write are handled in order without losing data.
 ### Key space: `HMap<Entry>`
 
 - Chained hashtable: array of slots, each slot heads a linked list.
+- Nodes live in a **chunked arena** (1,024 nodes per chunk), so growing it never
+  copies existing nodes; slot arrays are zero-initialized lazily.
 - Power-of-two size, so `hash & (size - 1)` picks the slot.
 - An `Entry` is either a string (`Vec<u8>`) or a sorted set.
 
@@ -118,6 +122,8 @@ jump forward/backward by rank in **O(log n)**, used by `zquery ... offset limit`
 - The smallest deadline is at the root.
 - A **back-reference** (`Arc<AtomicUsize>`) lets an entry find its current heap
   position; every sift updates it.
+- **Lazy expiry:** every key lookup checks the deadline and deletes a due key, so
+  commands never see expired data even if the background sweep is behind.
 - `process_expired` removes at most **2,000 keys per loop**, so a mass expiry does
   not freeze the server.
 
@@ -149,11 +155,14 @@ SIGINT/SIGTERM handler writes one byte to it, so `run()` returns cleanly.
 
 ## 7. Memory and safety
 
-- **Arena indices instead of pointers.** Nodes live in `Vec<Option<T>>`; links are
-  `Option<usize>`. A node's index is stable until it is removed.
+- **Arena indices instead of pointers.** Nodes live in a chunked arena of
+  `Option<T>`; links are `Option<usize>`. A node's index is stable until it is removed.
 - This avoids `container_of` and unsafe pointer arithmetic in every data structure.
-- **Only two `unsafe` sites:** the `poll(2)` FFI declaration and the signal handler's
-  one-byte `write(2)`. Everything else is safe Rust.
+- **Small `unsafe` surface, all FFI:** two `extern "C"` blocks (`poll` in
+  `server.rs`; `signal`/`write` in `bin/redis_server.rs`) and three call sites
+  (`poll`, `signal`, the signal handler's one-byte `write`), each with a
+  `SAFETY` comment. `signal()` returns `sighandler_t` as an integer because
+  `SIG_DFL`/`SIG_ERR` are not valid Rust function pointers.
 - **Ownership:** `Database` owns the map and heap; `ZSet` owns its nodes; `Server`
   owns the database and connections. Dropping the top owner frees everything.
 
@@ -170,12 +179,17 @@ SIGINT/SIGTERM handler writes one byte to it, so `run()` returns cleanly.
 | 1,000 | Sorted-set size that triggers async deletion |
 | 5,000 ms | Default idle timeout |
 | 4 | Default worker threads |
+| 4 MiB | Pending reply bytes per client before requests are held back |
+| 10,000 | Default max client connections |
+| 100 ms | Accept pause after `EMFILE`-style errors |
+| 127.0.0.1 | Default bind address (`--bind` to change) |
 
 ---
 
 ## 9. Testing
 
-- 55 Rust tests: each data structure, protocol, database layer, server, thread pool.
+- 70 Rust tests: each data structure, protocol, database layer, server, thread pool,
+  plus regression tests for the issues listed in `FINDINGS.md`.
 - Randomized differential tests against `std::collections` containers.
 - Exhaustive AVL/heap insert/delete position tests.
 - Real TCP tests: pipelining, 8 MiB values, malformed requests, idle timeouts,
@@ -195,10 +209,10 @@ SIGINT/SIGTERM handler writes one byte to it, so `run()` returns cleanly.
 | Single event loop | No locking on the hot path | One slow command blocks everyone |
 | Worker pool only for large deletes | Keeps hot path fast | Queue overhead (avoided by threshold) |
 | `poll(2)` | No third-party deps | O(connections) per loop, Linux-only |
-| `Vec::drain` for buffers | Simple | O(n) front removal |
+| Read-offset byte queues | O(1) amortized consume | Up to 2x buffer memory before compaction |
 | Host-endian integers | Matches the book | Not portable across endianness |
 
-If I had more time: `epoll`/`io_uring`, ring buffers, a hash seed against collision
+If I had more time: `epoll`/`io_uring`, a hash seed against collision
 attacks, and persistence (RDB/AOF).
 
 ---
@@ -249,8 +263,8 @@ back-references in sync on every sift, and making the borrow checker accept an
 index-based tree that needs to mutate several nodes per rotation.
 
 **What would you improve next?**
-Replace `poll` with `epoll` (O(1) readiness instead of O(n) scan), use a read offset or
-ring buffer instead of `Vec::drain` on the front, add a hash seed, and add persistence.
+Replace `poll` with `epoll` (O(1) readiness instead of O(n) scan), add a hash seed,
+replace `keys` with an incremental `scan`, and add persistence.
 
 ---
 

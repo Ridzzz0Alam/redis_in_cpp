@@ -178,11 +178,22 @@ fn bad<T>() -> Result<T, String> {
     Err("bad response".to_string())
 }
 
+/// Maximum array nesting accepted by [`decode_value`]. The server never nests
+/// arrays, so this only guards the client against a hostile or broken server:
+/// a 5-byte array header per level would otherwise allow millions of levels
+/// within one message and overflow the stack.
+pub const K_MAX_DEPTH: usize = 64;
+
 /// Decode one tagged value from the front of `data`, returning it and the
 /// number of bytes consumed.
-// Nested arrays are bounded by the message size, as in the C++ client.
-#[allow(clippy::only_used_in_recursion)]
 pub fn decode_value(data: &[u8]) -> Result<(Value, usize), String> {
+    decode_value_at(data, 0)
+}
+
+fn decode_value_at(data: &[u8], depth: usize) -> Result<(Value, usize), String> {
+    if depth > K_MAX_DEPTH {
+        return Err("response nested too deeply".to_string());
+    }
     let Some(&tag) = data.first() else {
         return bad();
     };
@@ -219,7 +230,7 @@ pub fn decode_value(data: &[u8]) -> Result<(Value, usize), String> {
             let mut items = Vec::new();
             let mut pos = 5usize;
             for _ in 0..n {
-                let (value, consumed) = decode_value(&data[pos..])?;
+                let (value, consumed) = decode_value_at(&data[pos..], depth + 1)?;
                 pos = pos.checked_add(consumed).ok_or("bad response")?;
                 items.push(value);
             }

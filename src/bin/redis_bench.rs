@@ -52,7 +52,13 @@ fn parse(args: &[String], o: &mut Options) -> bool {
                     v > 0
                 })
                 .unwrap_or(false),
-            "--requests" => value.parse().map(|v| o.requests = v).is_ok(),
+            "--requests" => value
+                .parse()
+                .map(|v| {
+                    o.requests = v;
+                    v > 0
+                })
+                .unwrap_or(false),
             "--pipeline" => value
                 .parse()
                 .map(|v| {
@@ -102,11 +108,15 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let per_client = o.requests / o.clients;
-    let rounds = per_client / o.pipeline;
+    if o.requests < o.clients {
+        eprintln!("--requests must be at least --clients");
+        return ExitCode::FAILURE;
+    }
     let value: Vec<u8> = vec![b'v'; o.value_size];
 
     let errors = Arc::new(AtomicUsize::new(0));
+    let connect_errors = Arc::new(AtomicUsize::new(0));
+    let completed = Arc::new(AtomicUsize::new(0));
     let start = Instant::now();
     let mut handles = Vec::new();
 
@@ -114,21 +124,27 @@ fn main() -> ExitCode {
         let o = o.clone();
         let value = value.clone();
         let errors = Arc::clone(&errors);
+        let connect_errors = Arc::clone(&connect_errors);
+        let completed = Arc::clone(&completed);
+        // Spread the remainder so exactly `requests` are sent in total.
+        let mine = o.requests / o.clients + usize::from(client < o.requests % o.clients);
         handles.push(std::thread::spawn(move || -> Vec<u32> {
-            let mut latencies = Vec::with_capacity(rounds);
+            let mut latencies = Vec::with_capacity(mine.div_ceil(o.pipeline));
             let mut stream = match net::connect_tcp("127.0.0.1", o.port) {
                 Ok(stream) => stream,
                 Err(_) => {
-                    errors.fetch_add(1, Ordering::Relaxed);
+                    connect_errors.fetch_add(1, Ordering::Relaxed);
                     return latencies;
                 }
             };
 
             let mut batch: Buffer = Buffer::new();
-            for r in 0..rounds {
+            let mut sent = 0;
+            while sent < mine {
+                let this_round = o.pipeline.min(mine - sent);
                 batch.clear();
-                for k in 0..o.pipeline {
-                    let req = encode_request(&make_cmd(&o, client, r * o.pipeline + k, &value));
+                for k in 0..this_round {
+                    let req = encode_request(&make_cmd(&o, client, sent + k, &value));
                     batch.extend_from_slice(&req);
                 }
                 let t0 = Instant::now();
@@ -137,7 +153,7 @@ fn main() -> ExitCode {
                     break;
                 }
                 let mut failed = false;
-                for _ in 0..o.pipeline {
+                for _ in 0..this_round {
                     if net::read_response(&mut stream).is_err() {
                         errors.fetch_add(1, Ordering::Relaxed);
                         failed = true;
@@ -148,6 +164,8 @@ fn main() -> ExitCode {
                     break;
                 }
                 latencies.push(t0.elapsed().as_micros() as u32);
+                sent += this_round;
+                completed.fetch_add(this_round, Ordering::Relaxed);
             }
             latencies
         }));
@@ -161,15 +179,22 @@ fn main() -> ExitCode {
     }
     let secs = start.elapsed().as_secs_f64();
 
+    let connect_count = connect_errors.load(Ordering::Relaxed);
+    if connect_count > 0 {
+        eprintln!(
+            "benchmark failed: {connect_count} clients could not connect - is the server running?"
+        );
+        return ExitCode::FAILURE;
+    }
     let error_count = errors.load(Ordering::Relaxed);
-    if all.is_empty() || error_count > 0 {
-        eprintln!("benchmark failed ({error_count} errors) - is the server running?");
+    if error_count > 0 {
+        eprintln!("benchmark failed: {error_count} clients hit a read/write error");
         return ExitCode::FAILURE;
     }
 
     all.sort_unstable();
     let pct = |p: f64| all[((p * (all.len() - 1) as f64) as usize).min(all.len() - 1)];
-    let total = all.len() * o.pipeline;
+    let total = completed.load(Ordering::Relaxed);
     println!(
         "{:<5} clients={:<4} pipeline={:<3} requests={:<8} | {:>10.0} ops/s | \
          round-trip p50 {} us, p99 {} us, max {} us",

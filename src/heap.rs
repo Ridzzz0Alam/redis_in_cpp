@@ -69,40 +69,44 @@ impl Heap {
         self.items.clear();
     }
 
-    fn up(&mut self, mut pos: usize) {
-        let t = self.items[pos].clone();
-        while pos > 0 && self.items[heap_parent(pos)].val > t.val {
-            self.items[pos] = self.items[heap_parent(pos)].clone();
-            self.items[pos].pos.store(pos, Ordering::Relaxed);
-            pos = heap_parent(pos);
-        }
-        self.items[pos] = t;
+    // Sifts move items with `swap`, so no `Arc` is cloned (two atomic RMWs)
+    // per level; each moved item's back-reference is updated as it moves.
+    fn set_pos(&self, pos: usize) {
         self.items[pos].pos.store(pos, Ordering::Relaxed);
     }
 
+    fn up(&mut self, mut pos: usize) {
+        while pos > 0 {
+            let parent = heap_parent(pos);
+            if self.items[parent].val <= self.items[pos].val {
+                break;
+            }
+            self.items.swap(pos, parent);
+            self.set_pos(pos);
+            pos = parent;
+        }
+        self.set_pos(pos);
+    }
+
     fn down(&mut self, mut pos: usize) {
-        let t = self.items[pos].clone();
         loop {
             let l = heap_left(pos);
             let r = heap_right(pos);
             let mut min_pos = pos;
-            let mut min_val = t.val;
-            if l < self.items.len() && self.items[l].val < min_val {
+            if l < self.items.len() && self.items[l].val < self.items[min_pos].val {
                 min_pos = l;
-                min_val = self.items[l].val;
             }
-            if r < self.items.len() && self.items[r].val < min_val {
+            if r < self.items.len() && self.items[r].val < self.items[min_pos].val {
                 min_pos = r;
             }
             if min_pos == pos {
                 break;
             }
-            self.items[pos] = self.items[min_pos].clone();
-            self.items[pos].pos.store(pos, Ordering::Relaxed);
+            self.items.swap(pos, min_pos);
+            self.set_pos(pos);
             pos = min_pos;
         }
-        self.items[pos] = t;
-        self.items[pos].pos.store(pos, Ordering::Relaxed);
+        self.set_pos(pos);
     }
 
     /// Restore the heap property starting at `pos`.
@@ -116,9 +120,9 @@ impl Heap {
 
     /// Remove the item at `pos` (swap-with-last, then re-sift).
     pub fn delete(&mut self, pos: usize) {
-        let moved = self.items.pop().expect("heap item");
+        let removed = self.items.swap_remove(pos);
+        removed.pos.store(NO_POS, Ordering::Relaxed);
         if pos < self.items.len() {
-            self.items[pos] = moved;
             self.update(pos);
         }
     }
@@ -145,6 +149,7 @@ impl Heap {
             return None;
         }
         let item = self.items.swap_remove(0);
+        item.pos.store(NO_POS, Ordering::Relaxed);
         if !self.items.is_empty() {
             self.update(0);
         }

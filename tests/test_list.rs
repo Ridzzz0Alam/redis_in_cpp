@@ -23,3 +23,20 @@ fn fifo_order_and_detach() {
     list.detach(_c);
     assert!(list.is_empty());
 }
+
+#[test]
+fn front_id_and_reuse() {
+    let mut list = DList::new();
+    assert_eq!(list.front_id(), None);
+    let a = list.push_back(10);
+    let b = list.push_back(20);
+    assert_eq!(list.front_id(), Some(a));
+    list.detach(a);
+    assert_eq!(list.front_id(), Some(b));
+    let c = list.push_back(30); // reuses a's slot
+    assert_eq!(list.values(), vec![20, 30]);
+    assert_eq!(list.len(), 2);
+    list.detach(b);
+    list.detach(c);
+    assert!(list.is_empty());
+}

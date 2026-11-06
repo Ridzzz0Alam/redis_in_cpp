@@ -7,6 +7,11 @@ The algorithms and command semantics come from *Build Your Own Redis with C/C++*
 James Smith, via this repository's former C++23 port. The C++ tree has been removed;
 this guide and `src/` are now the source of truth.
 
+> **Note:** code excerpts in this guide show the original, simpler version of each
+> function. `src/` has since been hardened (output backpressure, accept backoff,
+> lazy expiry, chunked arenas, and more); see `FINDINGS.md` for what changed and
+> why. When the two disagree, `src/` is correct.
+
 ---
 
 ## 0. How to use this guide
@@ -201,8 +206,8 @@ python3 tests/e2e/test_cmds.py \
 ```
 
 **Tip — checking memory.** The data structures are ordinary safe Rust, so the
-borrow checker already rules out most lifetime bugs. The only `unsafe` code is the
-`poll(2)` declaration and the signal handler's `write(2)` call. `cargo miri test`
+borrow checker already rules out most lifetime bugs. The only `unsafe` code is FFI:
+the `poll(2)` call and the `signal(2)`/`write(2)` calls in the server binary. `cargo miri test`
 can be used to check those code paths (Miri does not currently execute the real
 `poll` syscall, so run the non-server tests under it).
 
@@ -320,7 +325,9 @@ the wire (native byte order for lengths), documented in Appendix C.
 **Addresses.** Rust's `SocketAddr` replaces `sockaddr_in` + pointer casts:
 
 ```rust
-let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 1234)); // 0.0.0.0:1234
+let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 1234)); // 127.0.0.1:1234
+// Use Ipv4Addr::UNSPECIFIED (0.0.0.0) only if you mean to accept remote clients:
+// this server has no authentication.
 ```
 
 ### A minimal server and client
@@ -1611,9 +1618,8 @@ The test suites mirror the C++ ones:
 
 ## Appendix C — Known limitations & exercises
 
-1. **`buf_consume()` is O(n).** `Vec::drain(..n)` shifts every remaining byte. With
-   many pipelined requests this becomes quadratic. *Exercise:* keep a read offset
-   and compact occasionally, or implement a ring buffer.
+1. ~~**`buf_consume()` is O(n).**~~ Fixed: connections now use `ByteQueue`
+   (`src/buffer.rs`), which keeps a read offset and compacts occasionally.
 2. **`poll()` is O(number of connections) per iteration.** Every loop rebuilds and
    scans the fd list. *Exercise:* port to `epoll`/`io_uring` so the kernel tracks the
    interest set and returns only ready fds.
@@ -1632,8 +1638,8 @@ The test suites mirror the C++ ones:
 8. **Generic key types.** `HashNode::key` returns `&[u8]` and `HMap` is specialized
    to byte-string keys. *Exercise:* make the map generic over
    `K: Borrow<Q>` and a `Hash`/`Eq` bound.
-9. **Unsafe surface.** There are only two `unsafe` blocks: the `poll` FFI declaration
-   and the signal handler's `write(2)`. Keep it that way; Miri can check the rest.
+9. **Unsafe surface.** All `unsafe` is FFI: the `poll` call and the `signal`/`write`
+   calls in `bin/redis_server.rs`. Keep it that way; Miri can check the rest.
 
 ---
 

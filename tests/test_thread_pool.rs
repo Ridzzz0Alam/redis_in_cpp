@@ -48,3 +48,17 @@ fn idle_pool_shuts_down_promptly() {
     }
     assert!(start.elapsed() < Duration::from_secs(1));
 }
+
+#[test]
+fn panicking_job_does_not_kill_the_worker() {
+    let count = Arc::new(AtomicUsize::new(0));
+    {
+        let pool = ThreadPool::new(1);
+        pool.queue(|| panic!("boom (expected by this test)"));
+        let count = Arc::clone(&count);
+        pool.queue(move || {
+            count.fetch_add(1, Ordering::Relaxed);
+        });
+    }
+    assert_eq!(count.load(Ordering::Relaxed), 1);
+}

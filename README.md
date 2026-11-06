@@ -28,12 +28,19 @@ Python 3 for the end-to-end test. There are no third-party crates.
 
 | Command | Description |
 |---|---|
-| `get key` / `set key value` / `del key` | String values (binary-safe) |
-| `keys` | List all keys |
+| `get key` / `set key value` / `del key` | String values (binary-safe); `set` discards any TTL |
+| `keys` | List all keys (fails with "too big" past 32 MiB) |
 | `pexpire key ms` / `pttl key` | Set / read a TTL in milliseconds (`-1` no TTL, `-2` no key) |
 | `zadd zset score name` | Add or update a sorted-set member |
-| `zrem zset name` / `zscore zset name` | Remove / read a member |
-| `zquery zset score name offset limit` | Range query from `(score, name)`, O(log n) offset |
+| `zrem zset name` / `zscore zset name` | Remove / read a member (removing the last member deletes the key) |
+| `zquery zset score name offset limit` | Up to `limit` members from `(score, name)`, O(log n) offset; a negative offset past the end counts back from the last member |
+
+Command names are case-insensitive. Expired keys are never returned: they are
+deleted on access and also swept in the background.
+
+The server listens on `127.0.0.1` by default (it has no authentication); pass
+`--bind 0.0.0.0` to expose it deliberately. Other options: `--max-clients N`,
+`--idle-timeout-ms N`, `--threads N`, `--quiet`.
 
 ## Architecture
 
@@ -70,11 +77,15 @@ flowchart TB
 Design notes:
 
 - **The main thread never does unbounded work**: rehashing moves ≤128 keys per
-  operation, expiry deletes ≤2000 keys per loop iteration, and big sorted sets are
-  freed on the pool.
+  operation, expiry deletes ≤2000 keys per loop iteration, big sorted sets are
+  freed on the pool, and `keys`/`zquery` stop once a reply passes 32 MiB.
+- **Per-client limits**: a client's pending replies are capped (4 MiB by default;
+  further pipelined requests wait until it reads), connections are capped, and
+  `accept()` resource errors pause accepting instead of busy-looping.
 - **Arena indices instead of intrusive pointers**: safe Rust cannot store
   `container_of`-style back-pointers in arbitrary payloads, so each container keeps
-  nodes in a stable `Vec<Option<T>>` arena and links them by index. A `ZNode` is
+  nodes in a stable, chunked arena and links them by index (chunks never move, so
+  growing the arena does not copy every node). A `ZNode` is
   still in a hashtable *and* an AVL tree at once, with one allocation.
 - **Idle timers need no heap**: all connections share one timeout, so a FIFO list is
   already sorted by deadline (O(1) refresh).
@@ -122,7 +133,8 @@ once when it grows, while `HMap` spreads that work across later operations.
 
 - Linux only (POSIX sockets, `poll(2)`); `epoll`/`kqueue`/`io_uring` backends are a
   next step.
-- `poll()` scans every connection per iteration; front-erasing buffers are O(n).
+- `poll()` scans every connection per iteration.
+- Arena slots of deleted keys are reused but only released when a map empties.
 - Integers are sent in host byte order (little-endian on supported platforms).
 - No persistence or replication.
 - The `HashNode`/`AvlNode` traits are specialized to byte-string keys; generalizing

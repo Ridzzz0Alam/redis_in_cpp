@@ -72,10 +72,16 @@ fn print_row(name: &str, s: &Stats) {
 }
 
 fn main() -> ExitCode {
-    let n: usize = std::env::args()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5_000_000);
+    let n: usize = match std::env::args().nth(1) {
+        None => 5_000_000,
+        Some(arg) => match arg.parse() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                eprintln!("usage: bench_hashtable [N > 0]");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
 
     let keys: Vec<Vec<u8>> = (0..n)
         .map(|i| mix(i as u64).to_le_bytes().to_vec())

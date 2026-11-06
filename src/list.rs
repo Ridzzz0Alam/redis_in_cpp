@@ -88,6 +88,15 @@ impl DList {
         }
     }
 
+    /// The node id at the front, if any (pass it to [`detach`](Self::detach)).
+    pub fn front_id(&self) -> Option<usize> {
+        if self.is_empty() {
+            None
+        } else {
+            Some(self.nodes[0].next)
+        }
+    }
+
     /// Move `id` to the tail. Equivalent to detach + push_back with the same id.
     pub fn move_to_back(&mut self, id: usize) {
         let head = 0;

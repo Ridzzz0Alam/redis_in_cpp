@@ -5,6 +5,7 @@
 //! drains queued work and joins every worker.
 
 use std::collections::VecDeque;
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
@@ -90,6 +91,11 @@ fn worker(inner: Arc<Inner>) {
                 state = inner.not_empty.wait(state).expect("thread pool condvar");
             }
         };
-        job(); // run without holding the lock
+        // Run without holding the lock. A panicking job must not take its
+        // worker down with it, or the pool would silently shrink to zero
+        // threads while jobs keep piling up in the queue.
+        if std::panic::catch_unwind(AssertUnwindSafe(job)).is_err() {
+            eprintln!("thread pool: a job panicked; worker continues");
+        }
     }
 }

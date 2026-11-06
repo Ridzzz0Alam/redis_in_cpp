@@ -224,6 +224,15 @@ impl ZSet {
         found
     }
 
+    /// The greatest member, if any.
+    pub fn last(&self) -> Option<usize> {
+        let mut cur = self.root?;
+        while let Some(right) = self.hmap.get(cur).right() {
+            cur = right;
+        }
+        Some(cur)
+    }
+
     /// Jump `offset` members forwards/backwards from `idx`.
     pub fn node_offset(&self, idx: usize, offset: i64) -> Option<usize> {
         avl_offset(&self.hmap, idx, offset)

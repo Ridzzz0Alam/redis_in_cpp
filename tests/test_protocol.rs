@@ -172,3 +172,22 @@ fn format_matches_cli_output() {
     format_value(&value, &mut text);
     assert_eq!(text, b"(arr) len=2\n(str) n1\n(dbl) 1.1\n(arr) end\n");
 }
+
+#[test]
+fn deeply_nested_response_is_rejected_not_a_stack_overflow() {
+    // 1M levels of `arr(1)` would overflow the stack without a depth limit.
+    let mut data = Vec::new();
+    for _ in 0..1_000_000 {
+        out_arr(&mut data, 1);
+    }
+    out_nil(&mut data);
+    assert!(decode_value(&data).is_err());
+
+    // Nesting within the limit still decodes.
+    let mut ok = Vec::new();
+    for _ in 0..K_MAX_DEPTH {
+        out_arr(&mut ok, 1);
+    }
+    out_nil(&mut ok);
+    assert!(decode_value(&ok).is_ok());
+}

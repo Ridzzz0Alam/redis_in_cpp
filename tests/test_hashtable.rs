@@ -143,3 +143,28 @@ fn foreach_stops_early() {
     });
     assert_eq!(visits, 10);
 }
+
+// Spans several arena chunks, empties the map (which releases its memory) and
+// checks it is fully usable afterwards.
+#[test]
+fn many_chunks_drain_and_reuse() {
+    let mut map = HMap::new();
+    let n = 5000;
+    let idxs: Vec<usize> = (0..n)
+        .map(|i| map.insert(Item::new(&i.to_string(), i)))
+        .collect();
+    for (i, &idx) in idxs.iter().enumerate() {
+        assert!(map.contains_index(idx));
+        assert_eq!(map.get(idx).value, i as i32);
+    }
+    for i in 0..n {
+        assert!(erase(&mut map, &i.to_string()));
+    }
+    assert!(map.is_empty());
+    assert!(!map.contains_index(idxs[0]));
+    for i in 0..n {
+        map.insert(Item::new(&i.to_string(), i));
+    }
+    assert_eq!(map.len(), n as usize);
+    assert_eq!(lookup(&mut map, "4999").map(|it| it.value), Some(4999));
+}

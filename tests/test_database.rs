@@ -5,7 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use redis_rust::database::Database;
-use redis_rust::protocol::{decode_value, Value, ERR_BAD_ARG, ERR_BAD_TYP, ERR_UNKNOWN};
+use redis_rust::protocol::{
+    decode_value, Value, ERR_BAD_ARG, ERR_BAD_TYP, ERR_TOO_BIG, ERR_UNKNOWN,
+};
 use redis_rust::thread_pool::ThreadPool;
 use redis_rust::Buffer;
 
@@ -161,16 +163,101 @@ fn sorted_set_transcript() {
 }
 
 #[test]
-fn zquery_limit_counts_name_and_score() {
+fn zquery_limit_counts_members() {
     let mut h = Harness::new();
     for i in 0..5 {
         h.run(&["zadd", "z", &i.to_string(), &format!("m{i}")]);
     }
     assert_eq!(
-        h.run(&["zquery", "z", "0", "", "0", "4"]),
+        h.run(&["zquery", "z", "0", "", "0", "2"]),
         arr(vec![s("m0"), dbl(0.0), s("m1"), dbl(1.0)])
     );
+    assert_eq!(
+        h.run(&["zquery", "z", "0", "", "0", "1"]),
+        arr(vec![s("m0"), dbl(0.0)])
+    );
     assert_eq!(h.run(&["zquery", "z", "0", "", "0", "0"]), arr(vec![]));
+}
+
+#[test]
+fn zquery_negative_offset_past_the_end() {
+    let mut h = Harness::new();
+    for i in 0..5 {
+        h.run(&["zadd", "z", &i.to_string(), &format!("m{i}")]);
+    }
+    // Nothing is >= 100, so offsets count back from the last member.
+    assert_eq!(
+        h.run(&["zquery", "z", "100", "", "-1", "10"]),
+        arr(vec![s("m4"), dbl(4.0)])
+    );
+    assert_eq!(
+        h.run(&["zquery", "z", "100", "", "-2", "10"]),
+        arr(vec![s("m3"), dbl(3.0), s("m4"), dbl(4.0)])
+    );
+    assert_eq!(h.run(&["zquery", "z", "100", "", "0", "10"]), arr(vec![]));
+    assert_eq!(h.run(&["zquery", "z", "100", "", "-9", "10"]), arr(vec![]));
+}
+
+#[test]
+fn command_names_are_case_insensitive() {
+    let mut h = Harness::new();
+    assert_eq!(h.run(&["SET", "k", "v"]), nil());
+    assert_eq!(h.run(&["Get", "k"]), s("v"));
+    assert_eq!(h.run(&["get", "K"]), nil()); // keys stay case-sensitive
+}
+
+#[test]
+fn expired_keys_are_invisible_before_background_expiry() {
+    let mut h = Harness::new();
+    h.run(&["set", "k", "v"]);
+    h.run(&["zadd", "z", "1", "m"]);
+    h.run(&["pexpire", "k", "100"]);
+    h.run(&["pexpire", "z", "100"]);
+    h.advance(100); // due, but process_expired() has not run
+    assert_eq!(h.run(&["keys"]), arr(vec![]));
+    assert_eq!(h.run(&["get", "k"]), nil());
+    assert_eq!(h.run(&["pttl", "k"]), num(-2));
+    assert_eq!(h.run(&["zscore", "z", "m"]), nil());
+    assert_eq!(h.run(&["del", "z"]), num(0));
+    assert_eq!(h.db.size(), 0);
+    assert_eq!(h.db.next_expiry_ms(), None);
+    assert_eq!(h.db.process_expired(2000), 0);
+}
+
+#[test]
+fn set_discards_previous_ttl() {
+    let mut h = Harness::new();
+    h.run(&["set", "k", "v"]);
+    h.run(&["pexpire", "k", "100"]);
+    h.run(&["set", "k", "v2"]);
+    assert_eq!(h.run(&["pttl", "k"]), num(-1));
+    assert_eq!(h.db.next_expiry_ms(), None);
+    h.advance(1000);
+    assert_eq!(h.run(&["get", "k"]), s("v2"));
+}
+
+#[test]
+fn removing_last_member_deletes_the_zset() {
+    let mut h = Harness::new();
+    h.run(&["zadd", "z", "1", "a"]);
+    h.run(&["zadd", "z", "2", "b"]);
+    assert_eq!(h.run(&["zrem", "z", "a"]), num(1));
+    assert_eq!(h.db.size(), 1);
+    assert_eq!(h.run(&["zrem", "z", "b"]), num(1));
+    assert_eq!(h.db.size(), 0);
+    assert_eq!(h.run(&["keys"]), arr(vec![]));
+    // The name is free for any type again.
+    assert_eq!(h.run(&["set", "z", "v"]), nil());
+}
+
+#[test]
+fn oversized_keys_reply_is_cut_short() {
+    let mut h = Harness::new();
+    let big = "k".repeat(8 << 20);
+    for i in 0..5 {
+        h.run(&["set", &format!("{big}{i}"), "v"]); // 40 MiB of key names
+    }
+    assert_eq!(err_code(&h.run(&["keys"])), ERR_TOO_BIG);
 }
 
 #[test]

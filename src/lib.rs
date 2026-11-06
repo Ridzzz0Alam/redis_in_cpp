@@ -1,6 +1,7 @@
-//! A Rust port of the C++23 "Redis clone" in this repository.
+//! A Rust port of a C++23 "Redis clone" (itself based on the book *Build Your
+//! Own Redis with C/C++*). The C++ sources are no longer in this repository.
 //!
-//! The module layout mirrors the C++ project one-for-one:
+//! The module layout mirrors the original C++ project one-for-one:
 //!
 //! * `hashtable` — chained hashtable with bounded progressive rehashing
 //! * `avl`       — AVL tree with subtree counts (rank queries)

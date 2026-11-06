@@ -11,7 +11,7 @@ use crate::hashtable::{HMap, HashNode};
 use crate::heap::{Heap, HeapItem, HeapRef, NO_POS};
 use crate::protocol::{
     out_arr, out_begin_arr, out_dbl, out_end_arr, out_err, out_int, out_nil, out_str, ERR_BAD_ARG,
-    ERR_BAD_TYP, ERR_UNKNOWN,
+    ERR_BAD_TYP, ERR_TOO_BIG, ERR_UNKNOWN, K_MAX_MSG,
 };
 use crate::thread_pool::ThreadPool;
 use crate::zset::ZSet;
@@ -101,6 +101,22 @@ fn str2dbl(s: &[u8], out: &mut f64) -> bool {
     }
 }
 
+/// True if `ent` has a TTL that is due at `now`.
+fn entry_expired(heap: &Heap, ent: &Entry, now: u64) -> bool {
+    ent.ttl.as_ref().is_some_and(|pos_ref| {
+        heap.get(pos_ref.load(Ordering::Relaxed))
+            .is_some_and(|item| item.val <= now)
+    })
+}
+
+/// Replace everything written since `start` with an "too big" error. Used by
+/// commands whose output size depends on the data, so they stop as soon as
+/// the response can no longer be sent instead of building it in full.
+fn abort_too_big(out: &mut Buffer, start: usize) {
+    out.truncate(start);
+    out_err(out, ERR_TOO_BIG, "response is too big.");
+}
+
 impl Default for Database {
     fn default() -> Self {
         Self::new()
@@ -159,8 +175,12 @@ impl Database {
 
     /// Execute one parsed command, appending exactly one serialized value.
     pub fn execute(&mut self, cmd: &mut [Vec<u8>], out: &mut Buffer) {
-        let name: &[u8] = cmd.first().map_or(&[], Vec::as_slice);
-        match (cmd.len(), name) {
+        // Command names are case-insensitive, as in Redis.
+        let name = cmd
+            .first()
+            .map(|c| c.to_ascii_lowercase())
+            .unwrap_or_default();
+        match (cmd.len(), name.as_slice()) {
             (2, b"get") => self.do_get(cmd, out),
             (3, b"set") => self.do_set(cmd, out),
             (2, b"del") => self.do_del(cmd, out),
@@ -175,9 +195,19 @@ impl Database {
         }
     }
 
+    /// Find a live key. A key whose TTL is already due is deleted here
+    /// ("lazy expiry"), so commands never observe expired data even if the
+    /// background `process_expired` pass has not reached it yet.
     fn lookup(&mut self, key: &[u8]) -> Option<usize> {
         let hcode = str_hash(key);
-        self.map.lookup(key, hcode)
+        let idx = self.map.lookup(key, hcode)?;
+        let now = (self.clock)();
+        if entry_expired(&self.heap, self.map.get(idx), now) {
+            let ent = self.map.remove_index(idx).expect("expired entry");
+            self.entry_del(ent);
+            return None;
+        }
+        Some(idx)
     }
 
     fn insert_new(&mut self, key: Vec<u8>, value: DbValue) -> usize {
@@ -196,17 +226,15 @@ impl Database {
 
     fn do_set(&mut self, cmd: &mut [Vec<u8>], out: &mut Buffer) {
         if let Some(idx) = self.lookup(&cmd[1]) {
-            let ent = self.map.get_mut(idx);
-            match &mut ent.value {
-                DbValue::Str(s) => {
-                    s.clear();
-                    s.extend_from_slice(&cmd[2]);
-                    return out_nil(out);
-                }
+            match &mut self.map.get_mut(idx).value {
+                DbValue::Str(s) => *s = std::mem::take(&mut cmd[2]),
                 DbValue::ZSet(_) => {
                     return out_err(out, ERR_BAD_TYP, "a non-string value exists");
                 }
             }
+            // SET replaces the key, so any previous TTL is discarded (Redis).
+            self.set_ttl(idx, -1);
+            return out_nil(out);
         }
         let key = std::mem::take(&mut cmd[1]);
         let value = std::mem::take(&mut cmd[2]);
@@ -215,8 +243,10 @@ impl Database {
     }
 
     fn do_del(&mut self, cmd: &mut [Vec<u8>], out: &mut Buffer) {
-        let hcode = str_hash(&cmd[1]);
-        let removed = self.map.delete(&cmd[1], hcode);
+        // `lookup` already treats an expired key as absent (DEL returns 0).
+        let removed = self
+            .lookup(&cmd[1])
+            .and_then(|idx| self.map.remove_index(idx));
         if let Some(ent) = removed {
             self.entry_del(ent);
             out_int(out, 1);
@@ -248,7 +278,7 @@ impl Database {
                 NO_POS => None,
                 p => Some(p),
             };
-            let expire_at = (self.clock)() + ttl_ms as u64;
+            let expire_at = (self.clock)().saturating_add(ttl_ms as u64);
             self.heap.upsert(
                 pos,
                 HeapItem {
@@ -319,11 +349,25 @@ impl Database {
     }
 
     fn do_keys(&mut self, out: &mut Buffer) {
-        out_arr(out, self.map.len() as u32);
+        let now = (self.clock)();
+        let start = out.len();
+        let ctx = out_begin_arr(out);
+        let mut n = 0u32;
+        let mut too_big = false;
+        let heap = &self.heap;
         self.map.for_each(|_, ent| {
+            if entry_expired(heap, ent, now) {
+                return true; // logically gone; process_expired will free it
+            }
             out_str(out, &ent.key);
-            true
+            n += 1;
+            too_big = out.len() - start > K_MAX_MSG;
+            !too_big
         });
+        if too_big {
+            return abort_too_big(out, start);
+        }
+        out_end_arr(out, ctx, n);
     }
 
     // ZADD zset score name
@@ -358,8 +402,17 @@ impl Database {
             DbValue::Str(_) => return out_err(out, ERR_BAD_TYP, "expect zset"),
         };
         if let Some(member_idx) = member {
-            if let DbValue::ZSet(zset) = &mut self.map.get_mut(idx).value {
-                zset.delete(member_idx);
+            let now_empty = match &mut self.map.get_mut(idx).value {
+                DbValue::ZSet(zset) => {
+                    zset.delete(member_idx);
+                    zset.is_empty()
+                }
+                DbValue::Str(_) => false,
+            };
+            if now_empty {
+                // Redis never keeps an empty sorted set around.
+                let ent = self.map.remove_index(idx).expect("zset entry");
+                self.entry_del(ent);
             }
             out_int(out, 1);
         } else {
@@ -382,6 +435,10 @@ impl Database {
     }
 
     // ZQUERY zset score name offset limit
+    //
+    // Returns up to `limit` members (each as a name, score pair) starting
+    // `offset` ranks after the first member >= (score, name). A negative
+    // offset with no such member counts back from the last member.
     fn do_zquery(&mut self, cmd: &mut [Vec<u8>], out: &mut Buffer) {
         let mut score = 0.0f64;
         if !str2dbl(&cmd[2], &mut score) {
@@ -403,11 +460,16 @@ impl Database {
             DbValue::Str(_) => return out_err(out, ERR_BAD_TYP, "expect zset"),
         };
 
-        let mut member = zset.seekge(score, &cmd[3]);
-        if let Some(start) = member {
-            member = zset.node_offset(start, offset);
-        }
+        let mut member = match zset.seekge(score, &cmd[3]) {
+            Some(start) => zset.node_offset(start, offset),
+            // Past the end: offset -1 is the last member, -2 the one before...
+            None if offset < 0 => zset
+                .last()
+                .and_then(|last| zset.node_offset(last, offset + 1)),
+            None => None,
+        };
 
+        let start = out.len();
         let ctx = out_begin_arr(out);
         let mut n = 0i64;
         while let Some(m) = member {
@@ -416,9 +478,12 @@ impl Database {
             }
             out_str(out, zset.node(m).name());
             out_dbl(out, zset.score(m));
+            if out.len() - start > K_MAX_MSG {
+                return abort_too_big(out, start);
+            }
             member = zset.node_offset(m, 1);
-            n += 2;
+            n += 1;
         }
-        out_end_arr(out, ctx, n as u32);
+        out_end_arr(out, ctx, (2 * n) as u32);
     }
 }
