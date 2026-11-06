@@ -1,0 +1,34 @@
+[package]
+name = "redis-rust"
+version = "1.0.0"
+edition = "2021"
+description = "An in-memory Redis-like key-value server, ported to Rust"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "redis_rust"
+path = "src/lib.rs"
+
+[[bin]]
+name = "redis_server"
+path = "src/bin/redis_server.rs"
+
+[[bin]]
+name = "redis_cli"
+path = "src/bin/redis_cli.rs"
+
+[[bin]]
+name = "redis_bench"
+path = "src/bin/redis_bench.rs"
+
+[[bin]]
+name = "bench_hashtable"
+path = "src/bin/bench_hashtable.rs"
+
+# No third-party dependencies: the event loop talks to poll(2) directly and the
+# thread pool uses std::thread + std::sync.
+[dependencies]
+
+[profile.release]
+debug = true
