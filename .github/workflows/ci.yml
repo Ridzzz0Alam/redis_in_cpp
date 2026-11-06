@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests (debug)
+        run: cargo test
+
+      - name: Tests (release)
+        run: cargo test --release
+
+      - name: Release binaries
+        run: cargo build --release --bins
+
+      - name: End-to-end transcript
+        run: |
+          python3 tests/e2e/test_cmds.py \
+            --server target/release/redis_server \
+            --cli target/release/redis_cli
